@@ -1,0 +1,473 @@
+import re
+import unicodedata
+
+
+STOP_WORDS = {
+    "the", "and", "for", "that", "this", "with", "from",
+    "are", "was", "were", "has", "have", "had", "its",
+    "their", "they", "them", "you", "your", "can", "may",
+    "will", "would", "could", "should", "into", "onto",
+    "about", "also", "than", "then", "when", "where",
+    "which", "who", "what", "how", "why", "each", "both",
+    "such", "more", "most", "some", "many", "other",
+    "based", "using", "used", "use", "does", "did",
+    "notably", "therefore", "however", "overall",
+    "these", "those", "there", "here", "section", "table",
+}
+
+# Two-letter words that should never count as acronyms, even in ALL CAPS.
+SHORT_STOP_WORDS = {
+    "is", "of", "it", "to", "in", "on", "an", "as", "at", "be",
+    "by", "if", "or", "we", "he", "so", "do", "no", "up", "us",
+    "my", "me", "am", "go",
+}
+
+# Heuristic scores are never reported as certain.
+HEURISTIC_MAX_SCORE = 0.9
+
+CITATION_PATTERN = re.compile(
+    r"\[(?:[A-Za-z0-9_-]{6,}|(?:\d+(?:,\s*\d+)*))\]"
+)
+
+# Matches 20, 3.5, 1,000, 1,000.5 (the % sign is simply ignored).
+NUMBER_PATTERN = re.compile(r"(?<![\w.])\d+(?:,\d{3})*(?:\.\d+)?")
+
+# "one" is deliberately excluded: it is usually a pronoun ("one model").
+WORD_NUMBERS = {
+    "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9",
+    "ten": "10", "eleven": "11", "twelve": "12", "thirteen": "13",
+    "fourteen": "14", "fifteen": "15", "sixteen": "16",
+    "seventeen": "17", "eighteen": "18", "nineteen": "19",
+    "twenty": "20", "thirty": "30", "forty": "40", "fifty": "50",
+    "sixty": "60", "seventy": "70", "eighty": "80", "ninety": "90",
+    "hundred": "100", "thousand": "1000",
+}
+
+# Stem groups with opposite meaning. Used only for a warning flag.
+POSITIVE_STEMS = (
+    "improv", "gain", "increas", "boost", "enhanc", "outperform",
+)
+NEGATIVE_STEMS = (
+    "degrad", "declin", "decreas", "worsen", "drop", "reduc",
+    "underperform",
+)
+
+ABBREVIATIONS = {
+    "et al.": "ET_AL_TOKEN",
+    "e.g.": "EG_TOKEN",
+    "i.e.": "IE_TOKEN",
+    "vs.": "VS_TOKEN",
+    "Fig.": "FIG_TOKEN",
+    "Dr.": "DR_TOKEN",
+    "Inc.": "INC_TOKEN",
+    "approx.": "APPROX_TOKEN",
+    "Eq.": "EQ_TOKEN",
+}
+
+
+def _clean_text(text: str) -> str:
+    """Normalize Unicode, remove citation markers and formatting."""
+    text = unicodedata.normalize("NFKC", text or "")
+    text = CITATION_PATTERN.sub("", text)
+    text = re.sub(r"`([^`]*)`", r"\1", text)
+    text = re.sub(r"[*_]{1,3}", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+
+def _tokens(text: str) -> set[str]:
+    """Extract normalized terms for approximate lexical matching."""
+    cleaned = _clean_text(text)
+
+    raw_tokens = re.findall(
+        r"[A-Za-z0-9]+(?:['-][A-Za-z0-9]+)*", cleaned
+    )
+
+    result = set()
+    for raw in raw_tokens:
+        low = raw.lower()
+
+        if low in STOP_WORDS:
+            continue
+
+        if len(low) > 2:
+            result.add(low)
+        elif (
+            len(raw) == 2
+            and raw.isalpha()
+            and raw.isupper()
+            and low not in SHORT_STOP_WORDS
+        ):
+            # Keep short acronyms such as AI, RL, QA.
+            result.add(low)
+
+    return result
+
+
+def _normalize_number(value: str) -> str:
+    """Normalize '1,000' -> '1000', '20.0' -> '20', '3.50' -> '3.5'."""
+    value = value.replace(",", "")
+    try:
+        number = float(value)
+    except ValueError:
+        return value
+
+    if number == int(number):
+        return str(int(number))
+    return repr(number)
+
+
+def _numbers(text: str) -> set[str]:
+    """Extract normalized numeric values (digits and number words)."""
+    cleaned = _clean_text(text)
+
+    found = {
+        _normalize_number(match)
+        for match in NUMBER_PATTERN.findall(cleaned)
+    }
+
+    for word in re.findall(r"[a-z]+", cleaned.lower()):
+        if word in WORD_NUMBERS:
+            found.add(WORD_NUMBERS[word])
+
+    return found
+
+
+def _split_sentences(text: str) -> list[str]:
+    """Split prose into sentences while protecting common abbreviations."""
+    for original, token in ABBREVIATIONS.items():
+        # The lookbehind stops "fig." matching inside words like "config."
+        text = re.sub(
+            r"(?<![A-Za-z])" + re.escape(original),
+            token,
+            text,
+            flags=re.IGNORECASE,
+        )
+
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+
+    restored = []
+    for sentence in sentences:
+        for original, token in ABBREVIATIONS.items():
+            sentence = sentence.replace(token, original)
+
+        sentence = _clean_text(sentence)
+        if sentence:
+            restored.append(sentence)
+
+    return restored
+
+
+def split_claims(answer: str) -> list[str]:
+    """
+    Split an answer into prose sentences and meaningful table-cell claims.
+
+    Markdown table headers, separator rows, and citation-only content
+    are excluded. Category labels are attached to their descriptive cells.
+    """
+    if not answer or not answer.strip():
+        return []
+
+    claims = []
+    prose_lines = []
+
+    def flush_prose():
+        if not prose_lines:
+            return
+
+        text = " ".join(prose_lines)
+        prose_lines.clear()
+        claims.extend(_split_sentences(text))
+
+    for line in answer.splitlines():
+        stripped = line.strip()
+
+        if not stripped:
+            continue
+
+        if "|" not in stripped:
+            prose_lines.append(stripped)
+            continue
+
+        flush_prose()
+
+        cells = [
+            _clean_text(cell)
+            for cell in stripped.strip("|").split("|")
+        ]
+
+        if not cells or all(not cell for cell in cells):
+            continue
+
+        # Ignore Markdown separator rows.
+        if all(
+            re.fullmatch(r":?-{3,}:?", cell.replace(" ", "") or "")
+            for cell in cells
+        ):
+            continue
+
+        first = cells[0].strip().lower().rstrip(":")
+
+        if first in {
+            "category", "claim", "statement", "topic", "item",
+            "type", "method",
+        }:
+            continue
+
+        # Avoid verifying a row as one giant statement.
+        # Each descriptive cell is checked separately, with context.
+        category = cells[0]
+        for cell in cells[1:]:
+            if not cell:
+                continue
+
+            if category and category.lower() not in {
+                "—", "-", "n/a", "none"
+            }:
+                candidate = f"{category}: {cell}"
+            else:
+                candidate = cell
+
+            if _tokens(candidate):
+                claims.append(candidate)
+
+    flush_prose()
+
+    # Remove duplicate claims while preserving their original order.
+    unique_claims = []
+    seen = set()
+
+    for claim in claims:
+        normalized = _clean_text(claim)
+        if not _tokens(normalized):
+            continue
+
+        key = normalized.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique_claims.append(normalized)
+
+    return unique_claims
+
+
+def _has_negation(text: str) -> bool:
+    """Detect basic negation for diagnostics, not contradiction decisions."""
+    return bool(
+        re.search(
+            r"\b(?:not|no|never|none|without|cannot|can't|"
+            r"doesn't|isn't|aren't|neither|nor|false)\b|n['’]t\b",
+            text.lower(),
+        )
+    )
+
+
+def _direction(text: str) -> tuple[bool, bool]:
+    """Return (has_positive_term, has_negative_term) using word stems."""
+    words = re.findall(r"[a-z]+", text.lower())
+    positive = any(w.startswith(POSITIVE_STEMS) for w in words)
+    negative = any(w.startswith(NEGATIVE_STEMS) for w in words)
+    return positive, negative
+
+
+def _has_negation_conflict(claim: str, evidence_text: str) -> bool:
+    """
+    Conservatively identify possible polarity differences.
+
+    Two signals are used, both warning-only (they never change the label):
+      1. One side is negated (not/never/...) and the other is not.
+      2. One side uses an "improve"-type term and the other a
+         "degrade"-type term.
+    """
+    claim_tokens = _tokens(claim)
+    if len(claim_tokens) < 3:
+        return False
+
+    claim_negated = _has_negation(claim)
+    claim_pos, claim_neg = _direction(claim)
+
+    for sentence in _split_sentences(evidence_text):
+        sentence_tokens = _tokens(sentence)
+        shared = claim_tokens & sentence_tokens
+
+        overlap = len(shared) / max(1, len(claim_tokens))
+
+        if len(shared) < 3 or overlap < 0.40:
+            continue
+
+        # Signal 1: negation mismatch (needs stronger agreement).
+        if overlap >= 0.60 and claim_negated != _has_negation(sentence):
+            return True
+
+        # Signal 2: opposite direction words.
+        sent_pos, sent_neg = _direction(sentence)
+
+        if claim_pos and not claim_neg and sent_neg and not sent_pos:
+            return True
+        if claim_neg and not claim_pos and sent_pos and not sent_neg:
+            return True
+
+    return False
+
+
+def verify_claims(answer: str, evidence: list[dict]) -> list[dict]:
+    """
+    Assess claims with lexical overlap against retrieved passages.
+
+    Labels are heuristic:
+      - supported: high lexical overlap AND every number in the claim
+        appears in the supporting evidence
+      - insufficient_evidence: evidence is weak, ambiguous, or the claim
+        contains figures not found in the evidence
+
+    This implementation does not independently establish semantic
+    entailment or label a claim as contradicted.
+    """
+    claims = split_claims(answer)
+    results = []
+
+    usable_evidence = []
+
+    for item in evidence or []:
+        if not isinstance(item, dict):
+            continue
+
+        text = str(item.get("text", "") or "")
+        tokens = _tokens(text)
+
+        if tokens:
+            usable_evidence.append({
+                "item": item,
+                "text": text,
+                "tokens": tokens,
+            })
+
+    for claim in claims:
+        claim_tokens = _tokens(claim)
+
+        if not claim_tokens or not usable_evidence:
+            results.append({
+                "claim": claim,
+                "label": "insufficient_evidence",
+                "evidence_ids": [],
+                "score": 0.0,
+                "negation_warning": False,
+                "missing_numbers": [],
+                "explanation": (
+                    "No usable claim tokens or retrieved evidence."
+                ),
+            })
+            continue
+
+        scored = []
+
+        for row in usable_evidence:
+            overlap = (
+                len(claim_tokens & row["tokens"])
+                / len(claim_tokens)
+            )
+
+            scored.append({
+                "score": overlap,
+                "item": row["item"],
+                "text": row["text"],
+                "tokens": row["tokens"],
+            })
+
+        scored.sort(key=lambda row: row["score"], reverse=True)
+        best = scored[0]
+
+        # Use the strongest few passages with nontrivial overlap.
+        supporting_rows = [
+            row for row in scored if row["score"] >= 0.20
+        ][:3]
+
+        combined_tokens = set()
+        for row in supporting_rows:
+            combined_tokens.update(row["tokens"])
+
+        combined_score = (
+            len(claim_tokens & combined_tokens) / len(claim_tokens)
+        )
+
+        lexically_supported = (
+            best["score"] >= 0.60
+            or (
+                combined_score >= 0.70
+                and len(supporting_rows) >= 2
+                and best["score"] >= 0.30
+            )
+        )
+
+        # Numeric guard: every figure in the claim must appear in the
+        # supporting passages (or the best passage if none qualify).
+        claim_numbers = _numbers(claim)
+        number_rows = supporting_rows or [best]
+        evidence_numbers = set()
+        for row in number_rows:
+            evidence_numbers |= _numbers(row["text"])
+
+        missing_numbers = sorted(claim_numbers - evidence_numbers)
+        supported = lexically_supported and not missing_numbers
+
+        # Report possible polarity differences without automatically
+        # rejecting otherwise well-matched claims.
+        negation_warning = any(
+            _has_negation_conflict(claim, row["text"])
+            for row in supporting_rows
+        )
+
+        if supported:
+            label = "supported"
+            explanation = (
+                "Strong lexical overlap with retrieved evidence. "
+                "This heuristic does not prove semantic entailment."
+            )
+            relevant_rows = (
+                [best] if best["score"] >= 0.60
+                else supporting_rows
+            )
+            score = max(
+                best["score"],
+                combined_score if len(relevant_rows) > 1 else 0.0,
+            )
+        else:
+            label = "insufficient_evidence"
+            if lexically_supported and missing_numbers:
+                explanation = (
+                    "Wording overlaps with the evidence, but the claim "
+                    "contains figures not found in it: "
+                    + ", ".join(missing_numbers) + "."
+                )
+            else:
+                explanation = (
+                    "Lexical overlap is insufficient to establish support."
+                )
+            relevant_rows = [best] if best["score"] >= 0.25 else []
+            score = best["score"]
+
+        score = min(score, HEURISTIC_MAX_SCORE)
+
+        if negation_warning:
+            explanation += (
+                " A possible polarity difference was detected; "
+                "manual or semantic verification is recommended."
+            )
+
+        evidence_ids = list(dict.fromkeys(
+            row["item"].get("chunk_id")
+            for row in relevant_rows
+            if row["item"].get("chunk_id")
+        ))
+
+        results.append({
+            "claim": claim,
+            "label": label,
+            "evidence_ids": evidence_ids,
+            "score": round(score, 3),
+            "negation_warning": negation_warning,
+            "missing_numbers": missing_numbers,
+            "explanation": explanation,
+        })
+
+    return results

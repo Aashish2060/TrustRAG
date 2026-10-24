@@ -1,0 +1,45 @@
+from src.verification.evidence_verifier import verify_claims
+from src.verification.reliability import reliability_score
+
+class CorrectionController:
+    def __init__(self, retriever, generator, max_corrections=2):
+        self.retriever, self.generator = retriever, generator
+        self.max_corrections = max(0, min(2, int(max_corrections)))
+
+    def run(self, question: str, top_k: int = 4, mode: str = "self_correcting"):
+        import time
+        start = time.perf_counter()
+        evidence = self.retriever.search(question, top_k=top_k)
+        initial = self.generator.generate(question, evidence)
+        initial_claims = verify_claims(initial, evidence)
+        attempts = []
+        final_answer, final_claims, final_evidence = initial, initial_claims, evidence
+        if mode in {"verified", "self_correcting"}:
+            for attempt_num in range(self.max_corrections if mode == "self_correcting" else 0):
+                failed = [c for c in final_claims if c["label"] != "supported"]
+                if not failed:
+                    break
+                seen = {e["chunk_id"] for e in final_evidence}
+                expanded = self.retriever.search(question, top_k=max(top_k * 2, top_k + 2), exclude_ids=seen)
+                if not expanded:
+                    attempts.append({"attempt": attempt_num + 1, "outcome": "stopped_no_new_evidence", "new_evidence_count": 0})
+                    break
+                combined = final_evidence + expanded
+                revised = self.generator.generate(question, combined, instruction="Correct only claims that are not supported. Prefer a short answer. If evidence is insufficient, explicitly abstain.")
+                revised_claims = verify_claims(revised, combined)
+                before = sum(c["label"] == "supported" for c in final_claims)
+                after = sum(c["label"] == "supported" for c in revised_claims)
+                accepted = after >= before and all(c["label"] == "supported" for c in revised_claims)
+                attempts.append({"attempt": attempt_num + 1, "outcome": "accepted" if accepted else "rejected_or_unresolved", "new_evidence_count": len(expanded), "supported_claims_before": before, "supported_claims_after": after})
+                final_evidence = combined
+                if accepted:
+                    final_answer, final_claims = revised, revised_claims
+                    break
+                # Keep the safer previous answer; don't replace it with a weaker revision.
+                break
+        reliability = reliability_score(final_claims, final_evidence)
+        if not final_evidence or not final_claims or any(c["label"] != "supported" for c in final_claims):
+            status = "insufficient_evidence_or_unverified"
+        else:
+            status = "evidence_supported_by_heuristic"
+        return {"question": question, "initial_answer": initial, "final_answer": final_answer, "answer_status": status, "claims": final_claims, "evidence": final_evidence, "correction_attempts": attempts, "reliability_score": reliability["score"], "reliability_signals": reliability, "latency_seconds": round(time.perf_counter() - start, 4), "mode": mode}
