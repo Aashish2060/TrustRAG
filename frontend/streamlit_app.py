@@ -59,7 +59,7 @@ def main():
                 with st.expander("Initial answer"):
                     st.write(result["initial_answer"])
                 with st.expander("Claim verification"):
-                    st.dataframe(result["claims"], use_container_width=True)
+                    st.dataframe(result["claims"], width="stretch")
                 with st.expander("Retrieved evidence"):
                     for item in result["evidence"]:
                         st.markdown(f"**{item['filename']}** · page {item.get('page') or 'N/A'} · chunk `{item['chunk_id']}` · similarity {item.get('similarity', 0):.3f}")
