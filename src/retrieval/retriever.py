@@ -16,6 +16,8 @@ FILLER = {
     # added: words that only frame the question
     "say", "said", "state", "claim", "report", "mention", "show",
     "according", "authors",
+    # added: inflected forms the stemmer doesn't reduce, plus framing words
+    "reported", "found", "including",
 }
 
 # Question word -> words the document may use instead.
@@ -38,6 +40,12 @@ SYNONYMS = {
     "conclude": ["results", "show", "outperform"],
     "university": ["department", "roorkee"],
 }
+
+# Splits a long multi-part question into sub-questions.
+SPLIT_RE = re.compile(
+    r"\s*(?:,\s*(?:including|and)?|;|\band\b|\bas well as\b|\bincluding\b)\s*",
+    re.IGNORECASE,
+)
 
 
 def _stem(word: str) -> str:
@@ -147,7 +155,7 @@ class Retriever:
         for i, chunk in enumerate(chunks):
             heading = {
                 _stem(w) for w in re.findall(
-                    r"[a-z0-9]+", chunk.get("section_title", "").lower()
+                    r"[a-z0-9]+", (chunk.get("section_title") or "").lower()
                 )
             }
             if query_terms & heading:
@@ -178,3 +186,38 @@ class Retriever:
                 break
 
         return results
+
+    def search_compound(
+        self,
+        query: str,
+        top_k: int = 4,
+        exclude_ids: set[str] | None = None,
+        max_groups: int = 6,
+    ) -> list[dict]:
+        """Split long multi-part questions, search each part, merge results.
+
+        Short questions go straight to search(), so behaviour for them is
+        unchanged. Each merged item records which sub-question it matched in
+        `matched_subquery`.
+        """
+        if len(self._query_groups(query)) <= max_groups:
+            return self.search(query, top_k, exclude_ids)
+
+        parts = [p.strip() for p in SPLIT_RE.split(query) if p and p.strip()]
+        parts = [p for p in parts if len(self._query_groups(p)) >= 2]
+        if len(parts) < 2:
+            return self.search(query, top_k, exclude_ids)
+
+        merged = {}
+        for part in parts:
+            for item in self.search(part, top_k=top_k, exclude_ids=exclude_ids):
+                cid = item["chunk_id"]
+                if cid not in merged or item["similarity"] > merged[cid]["similarity"]:
+                    merged[cid] = {**item, "matched_subquery": part}
+
+        ranked = sorted(
+            merged.values(),
+            key=lambda r: r["similarity"] * (0.5 + r["coverage"]),
+            reverse=True,
+        )
+        return ranked[:top_k]

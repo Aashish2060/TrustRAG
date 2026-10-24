@@ -8,7 +8,7 @@ from src.verification.reliability import reliability_score
 
 # ----------------------------------------------------------------------
 # Rules given to the generator (used on revisions and, if enabled, on the
-# first answer too)
+# first answer too; baseline mode never uses them)
 # ----------------------------------------------------------------------
 USE_RULES_ON_FIRST_ANSWER = True
 
@@ -172,12 +172,24 @@ class CorrectionController:
         self.retriever, self.generator = retriever, generator
         self.max_corrections = max(0, min(2, int(max_corrections)))
 
+    def _search(self, question: str, top_k: int, exclude_ids=None):
+        """Use compound-question retrieval when the retriever supports it,
+        otherwise fall back to plain search()."""
+        search = getattr(self.retriever, "search_compound", None) or self.retriever.search
+        if exclude_ids is None:
+            return search(question, top_k=top_k)
+        return search(question, top_k=top_k, exclude_ids=exclude_ids)
+
     def run(self, question: str, top_k: int = 4, mode: str = "self_correcting"):
         start = time.perf_counter()
 
-        evidence = self.retriever.search(question, top_k=top_k)
+        evidence = self._search(question, top_k)
 
-        if USE_RULES_ON_FIRST_ANSWER and evidence:
+        # Baseline is a plain answer: no reviewer rules. It is still
+        # verified below so the evaluation has claims to measure.
+        use_rules = USE_RULES_ON_FIRST_ANSWER and mode != "baseline"
+
+        if use_rules and evidence:
             try:
                 initial = self.generator.generate(
                     question, evidence, instruction=_BASE_RULES
@@ -204,9 +216,9 @@ class CorrectionController:
                     break
 
                 seen = {e["chunk_id"] for e in pool}
-                expanded = self.retriever.search(
+                expanded = self._search(
                     question,
-                    top_k=max(top_k * 2, top_k + 2),
+                    max(top_k * 2, top_k + 2),
                     exclude_ids=seen,
                 )
 
