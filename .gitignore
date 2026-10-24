@@ -10,3 +10,6 @@ reports/*.csv
 reports/*.json
 reports/*.png
 .streamlit/
+
+out.txt
+*.bak
