@@ -20,6 +20,16 @@ FILLER = {
     "reported", "found", "including",
 }
 
+# Words that name WHAT is asked about a topic ("limitations of X",
+# "improvement from X"). A document may express them in other words, so
+# they count for less in coverage than the topic words themselves.
+# (Entries are in stemmed form: plural "s" removed.)
+ASPECT_WORDS = {
+    "limitation", "improvement", "drawback", "challenge",
+    "advantage", "benefit", "effect", "impact", "finding", "outcome",
+}
+ASPECT_WEIGHT = 0.35
+
 # Question word -> words the document may use instead.
 SYNONYMS = {
     "author": ["submitted", "by", "names", "students", "written"],
@@ -137,7 +147,14 @@ class Retriever:
             # (and counts fully against coverage).
             return math.log((n + 1) / (df[word] + 1)) + 1 if word in df else max_idf
 
-        group_weight = [max(idf(w) for w in g) for g in groups]
+        # Topic words count fully; aspect words ("limitation",
+        # "improvement") count less, because documents often express
+        # them in other words.
+        group_weight = [
+            max(idf(w) for w in g)
+            * (ASPECT_WEIGHT if g[0] in ASPECT_WORDS else 1.0)
+            for g in groups
+        ]
         total_weight = sum(group_weight)
 
         coverage = np.zeros(n)
@@ -204,12 +221,22 @@ class Retriever:
             return self.search(query, top_k, exclude_ids)
 
         parts = [p.strip() for p in SPLIT_RE.split(query) if p and p.strip()]
-        parts = [p for p in parts if len(self._query_groups(p)) >= 2]
+        parts = [p for p in parts if self._query_groups(p)]
         if len(parts) < 2:
             return self.search(query, top_k, exclude_ids)
 
+        # A short part such as "the reported improvement" loses its subject
+        # when split, so it borrows the subject of the first full part
+        # ("Explain Self-Refine").
+        anchor = next((p for p in parts if len(self._query_groups(p)) >= 2), None)
+        sub_queries = []
+        for p in parts:
+            if anchor and p is not anchor and len(self._query_groups(p)) < 2:
+                p = f"{anchor} {p}"
+            sub_queries.append(p)
+
         merged = {}
-        for part in parts:
+        for part in sub_queries:
             for item in self.search(part, top_k=top_k, exclude_ids=exclude_ids):
                 cid = item["chunk_id"]
                 if cid not in merged or item["similarity"] > merged[cid]["similarity"]:
