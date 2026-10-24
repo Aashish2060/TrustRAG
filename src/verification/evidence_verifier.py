@@ -73,6 +73,7 @@ ABBREVIATIONS = {
 
 # Typographic characters that LLMs often emit, mapped to plain ASCII.
 _CHAR_MAP = {
+    0x200B: None, 0x200C: None, 0x200D: None, 0x2060: None, 0xFEFF: None,  # invisible
     0x2010: "-", 0x2011: "-",                       # hyphens
     0x2012: " - ", 0x2013: " - ", 0x2014: " - ",    # dashes
     0x2015: " - ", 0x2212: " - ",
